@@ -9,7 +9,7 @@ use miette::{bail, Result};
 use serde::Deserialize;
 use sha2::Digest;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -848,6 +848,59 @@ impl App {
 
         if self.has_processes()? {
             self.up(None, &true, &false)?;
+
+            // if process-compose socket exists, use it to wait for processes
+            let process_compose_socket = self.devenv_runtime.join("pc.sock");
+
+            if process_compose_socket.exists() {
+                let _logprogress = log::LogProgress::new("Waiting for processes to start", true);
+
+                // connect to socket and send http request
+                let mut stream = std::os::unix::net::UnixStream::connect(&process_compose_socket)
+                    .expect("Failed to connect to process-compose socket");
+
+                loop {
+                    // send http request over unix socket
+                    stream
+                        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .expect("Failed to write to process-compose socket");
+
+                    // read response
+                    let mut buffer = Vec::new();
+                    loop {
+                        let mut chunk = [0; 1024];
+                        let bytes_read = stream
+                            .read(&mut chunk)
+                            .expect("Failed to read from process-compose socket");
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        buffer.extend_from_slice(&chunk[..bytes_read]);
+                    }
+
+                    // split response to get the body
+                    let response = String::from_utf8_lossy(&buffer);
+                    let body = response.split("\r\n\r\n").collect::<Vec<&str>>()[1];
+                    // parse body into ProcessCompose
+                    let process_compose: ProcessCompose = serde_json::from_str(body)
+                        .expect("Failed to parse process-compose socket response");
+
+                    if process_compose
+                        .data
+                        .iter()
+                        .all(|process| process.is_running)
+                    {
+                        break;
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            } else {
+                self.logger.warn(&format!(
+                    "No {} found, likely you're using another process manager.",
+                    process_compose_socket.display()
+                ));
+            }
         }
 
         let result = {
@@ -1273,4 +1326,15 @@ fn max_jobs() -> u8 {
         std::num::NonZeroUsize::new(1).unwrap()
     });
     (num_cpus.get() / 2).try_into().unwrap()
+}
+
+#[derive(Deserialize)]
+struct ProcessComposeProcesses {
+    #[serde(rename = "IsRunning")]
+    is_running: bool,
+}
+
+#[derive(Deserialize)]
+struct ProcessCompose {
+    data: Vec<ProcessComposeProcesses>,
 }
