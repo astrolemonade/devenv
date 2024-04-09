@@ -849,57 +849,83 @@ impl App {
         if self.has_processes()? {
             self.up(None, &true, &false)?;
 
+            let pid =
+                fs::read_to_string(self.processes_pid()).expect("Failed to read processes pid");
+            let pid =
+                process_alive::Pid::from(pid.trim().parse::<u32>().expect("Failed to parse pid"));
+
             // if process-compose socket exists, use it to wait for processes
             let process_compose_socket = self.devenv_runtime.join("pc.sock");
+            let start_time = SystemTime::now();
 
-            if process_compose_socket.exists() {
-                let _logprogress = log::LogProgress::new("Waiting for processes to start", true);
-
-                // connect to socket and send http request
-                let mut stream = std::os::unix::net::UnixStream::connect(&process_compose_socket)
-                    .expect("Failed to connect to process-compose socket");
-
+            {
+                let _logprogress =
+                    log::LogProgress::new("Waiting for process-compose to start", true);
                 loop {
-                    // send http request over unix socket
-                    stream
-                        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                        .expect("Failed to write to process-compose socket");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
 
-                    // read response
-                    let mut buffer = Vec::new();
-                    loop {
-                        let mut chunk = [0; 1024];
-                        let bytes_read = stream
-                            .read(&mut chunk)
-                            .expect("Failed to read from process-compose socket");
-                        if bytes_read == 0 {
-                            break;
-                        }
-                        buffer.extend_from_slice(&chunk[..bytes_read]);
-                    }
-
-                    // split response to get the body
-                    let response = String::from_utf8_lossy(&buffer);
-                    let body = response.split("\r\n\r\n").collect::<Vec<&str>>()[1];
-                    // parse body into ProcessCompose
-                    let process_compose: ProcessCompose = serde_json::from_str(body)
-                        .expect("Failed to parse process-compose socket response");
-
-                    if process_compose
-                        .data
-                        .iter()
-                        .all(|process| process.is_running)
-                    {
+                    if process_compose_socket.exists() {
                         break;
                     }
 
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let state = process_alive::state(pid);
+                    println!("{:?}", state);
+
+                    if process_alive::state(pid) != process_alive::State::Alive {
+                        bail!("process-compose crashed");
+                    }
+
+                    if start_time.elapsed().unwrap().as_secs() > 60 {
+                        bail!("Failed to start process-compose in 60s");
+                    }
                 }
-            } else {
-                self.logger.warn(&format!(
-                    "No {} found, likely you're using another process manager.",
-                    process_compose_socket.display()
-                ));
+            }
+
+            let _logprogress = log::LogProgress::new("Waiting for processes to start", true);
+
+            // connect to socket and send http request
+            let mut stream = std::os::unix::net::UnixStream::connect(&process_compose_socket)
+                .expect("Failed to connect to process-compose socket");
+
+            loop {
+                // send http request over unix socket
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .expect("Failed to write to process-compose socket");
+
+                // read response
+                let mut buffer = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let bytes_read = stream
+                        .read(&mut chunk)
+                        .expect("Failed to read from process-compose socket");
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..bytes_read]);
+                }
+
+                // split response to get the body
+                let response = String::from_utf8_lossy(&buffer);
+                let body = response.split("\r\n\r\n").collect::<Vec<&str>>()[1];
+                // parse body into ProcessCompose
+                let process_compose: ProcessCompose = serde_json::from_str(body)
+                    .expect("Failed to parse process-compose socket response");
+
+                if process_compose
+                    .data
+                    .iter()
+                    .all(|process| process.is_running)
+                {
+                    break;
+                }
+
+                if start_time.elapsed().unwrap().as_secs() > 60 {
+                    bail!("Failed to start processes in 60s");
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
 
